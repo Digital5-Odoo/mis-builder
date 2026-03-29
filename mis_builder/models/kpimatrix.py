@@ -144,6 +144,7 @@ class KpiMatrix:
         env,
         multi_company=False,
         query_companies=None,
+        companies_as_columns=False,
         account_model="account.account",
     ):
         # cache language id for faster rendering
@@ -152,6 +153,7 @@ class KpiMatrix:
         self._style_model = env["mis.report.style"]
         self._account_model = env[account_model]
         self._query_companies = query_companies
+        self._companies_as_columns = companies_as_columns
         # data structures
         # { kpi: KpiMatrixRow }
         self._kpi_rows = OrderedDict()
@@ -483,7 +485,7 @@ class KpiMatrix:
             if account_companies:
                 code = account.with_company(account_companies[0]).code
         result = f"{code} {account.name}" if code else account.name
-        if self._multi_company:
+        if self._multi_company and not self._companies_as_columns:
             company_names = ", ".join(account.company_ids.mapped("name"))
             result = f"{result} [{company_names}]"
         return result
