@@ -539,10 +539,19 @@ class MisReport(models.Model):
 
     # TODO: kpi name cannot be start with query name
 
-    def prepare_kpi_matrix(self, multi_company=False, query_companies=None):
+    def prepare_kpi_matrix(
+        self,
+        multi_company=False,
+        query_companies=None,
+        companies_as_columns=False,
+    ):
         self.ensure_one()
         kpi_matrix = KpiMatrix(
-            self.env, multi_company, query_companies, self.account_model
+            self.env,
+            multi_company,
+            query_companies,
+            companies_as_columns,
+            self.account_model,
         )
         for kpi in self.kpi_ids:
             kpi_matrix.declare_kpi(kpi)

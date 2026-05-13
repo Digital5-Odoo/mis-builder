@@ -552,6 +552,48 @@ class TestMisReportInstance(common.HttpCase):
             "Account codes should not show as 'False' in multi-company reports",
         )
 
+    def test_generate_company_columns(self):
+        """action_generate_company_columns creates one period per company + Total."""
+        company2 = self.env["res.company"].create({"name": "Branch Co"})
+        report = self.env["mis.report"].create({"name": "MC Columns Report"})
+        instance = self.env["mis.report.instance"].create(
+            {
+                "name": "MC Columns Instance",
+                "report_id": report.id,
+                "multi_company": True,
+                "company_ids": [
+                    (4, self.env.ref("base.main_company").id),
+                    (4, company2.id),
+                ],
+            }
+        )
+        instance.action_generate_company_columns()
+        periods = instance.period_ids.sorted("sequence")
+        # Expect 3 periods: main_company, company2, Total
+        self.assertEqual(len(periods), 3)
+        self.assertEqual(periods[0].company_id, self.env.ref("base.main_company"))
+        self.assertEqual(periods[1].company_id, company2)
+        self.assertFalse(periods[2].company_id)
+        self.assertEqual(periods[2].source, "sumcol")
+        self.assertTrue(instance.comparison_mode)
+
+    def test_generate_company_columns_guard(self):
+        """action_generate_company_columns raises UserError when preconditions unmet."""
+        from odoo.exceptions import UserError
+
+        report = self.env["mis.report"].create({"name": "MC Guard Report"})
+        # single-company instance (multi_company=False)
+        instance = self.env["mis.report.instance"].create(
+            {"name": "MC Guard Instance", "report_id": report.id}
+        )
+        with self.assertRaises(UserError):
+            instance.action_generate_company_columns()
+        # multi_company=True but only 1 company selected
+        instance.multi_company = True
+        instance._onchange_company()
+        with self.assertRaises(UserError):
+            instance.action_generate_company_columns()
+
     def test_qweb(self):
         self.report_instance.print_pdf()  # get action
         test_reports.try_report(
