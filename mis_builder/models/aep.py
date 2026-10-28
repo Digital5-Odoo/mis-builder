@@ -1,6 +1,7 @@
 # Copyright 2014 ACSONE SA/NV (<http://acsone.eu>)
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl.html).
 
+import fnmatch
 import logging
 import re
 from collections import defaultdict
@@ -163,6 +164,8 @@ class AccountingExpressionProcessor:
         self._map_account_ids = defaultdict(set)
         # {account_domain: set(account_ids)}
         self._account_ids_by_acc_domain = defaultdict(set)
+        # [(account_id, code)] for all accounts, read once
+        self._account_codes = None
         # smart ending balance (returns AccountingNone if there
         # are no moves in period and 0 initial balance), implies
         # a first query to get the initial balance and another
@@ -274,27 +277,121 @@ class AccountingExpressionProcessor:
                         )
                     )
 
+    def _code_selectors(self, acc_domain):
+        """Split an account domain into code selectors, or None if it is not one.
+
+        `_account_codes_to_domain` builds domains made only of `code` leaves
+        joined by OR, which is what the vast majority of expressions use. An
+        account selector can also be an arbitrary domain, and those go the slow
+        way.
+        """
+        selectors = []
+        for leaf in acc_domain:
+            if leaf == expression.OR_OPERATOR:
+                continue
+            if not isinstance(leaf, tuple | list) or len(leaf) != 3:
+                return None
+            field, operator, value = leaf
+            if field != "code" or operator not in ("=", "=like"):
+                return None
+            selectors.append((operator, value))
+        return selectors or None
+
+    @staticmethod
+    def _code_matches(selectors, code):
+        for operator, value in selectors:
+            if operator == "=":
+                if code == value:
+                    return True
+            elif value.endswith("%") and "%" not in value[:-1] and "_" not in value:
+                # The usual case by far, and startswith is an order of magnitude
+                # cheaper than fnmatch.
+                if code.startswith(value[:-1]):
+                    return True
+            elif fnmatch.fnmatchcase(code, value.replace("_", "?").replace("%", "*")):
+                return True
+        return False
+
+    def _all_account_codes(self):
+        """[(account_id, code)] for the companies of this AEP, read once.
+
+        Searching accounts by code is expensive: `code` is not a column, it is
+        computed over `code_store`, a company dependent jsonb, so every search by
+        code is a full scan of account.account expanding that jsonb row by row.
+        A report with dozens of KPIs does that hundreds of times.
+
+        Reading every code once and matching the selectors in memory turns those
+        hundreds of scans into one read per root company. Codes are keyed by the
+        ROOT company, so that is the granularity to iterate.
+        """
+        if self._account_codes is None:
+            self._account_codes = []
+            for root in self.companies.root_id:
+                companies = self.companies.filtered(lambda c, r=root: c.root_id == r)
+                accounts = self._account_model.with_company(root).search(
+                    [("company_ids", "in", companies.ids)]
+                )
+                self._account_codes += [
+                    (account.id, account.code) for account in accounts if account.code
+                ]
+            _logger.debug(
+                "read %d account codes for %d companies",
+                len(self._account_codes),
+                len(self.companies),
+            )
+        return self._account_codes
+
+    def _search_accounts_by_code(self, selectors):
+        return {
+            account_id
+            for account_id, code in self._all_account_codes()
+            if self._code_matches(selectors, code)
+        }
+
+    def _search_accounts(self, acc_domain):
+        """Resolve one account domain to account ids, for all companies.
+
+        Accounts are searched once per distinct root company and not once per
+        company, because that is the granularity that matters: account codes are
+        stored in a company dependent field keyed by the root company, so
+        companies sharing a root give the exact same result (see _search_code in
+        account/models/account_account.py). On a database where every company is
+        its own root this is the same as before; on a hierarchy it divides the
+        number of queries by the size of the branches.
+
+        This matters because searching by code is expensive: `code` is not a
+        column, it is computed over a company dependent jsonb, so every search is
+        a full scan of account.account.
+        """
+        account_ids = set()
+        for root in self.companies.root_id:
+            companies = self.companies.filtered(lambda c, r=root: c.root_id == r)
+            acc_domain_with_company = expression.AND(
+                [acc_domain, [("company_ids", "in", companies.ids)]]
+            )
+            account_ids.update(
+                self._account_model.with_company(root)
+                .search(acc_domain_with_company)
+                .ids
+            )
+        return account_ids
+
     def done_parsing(self):
         """Replace account domains by account ids in map"""
         for key, acc_domains in self._map_account_ids.items():
             all_account_ids = set()
             for acc_domain in acc_domains:
-                # XXX It is apparently not possible to search accounts by code
-                # across multiple companies at once (due to how _search_code is
-                # implemented for instance), so we have to search each company
-                # separately.
-                account_ids = []
-                for company in self.companies:
-                    acc_domain_with_company = expression.AND(
-                        [acc_domain, [("company_ids", "=", company.id)]]
+                # Same domain in several KPIs: resolve it once. A P&L repeats the
+                # same account selectors in many lines, and each search is a full
+                # scan of account.account.
+                if acc_domain not in self._account_ids_by_acc_domain:
+                    selectors = self._code_selectors(acc_domain)
+                    self._account_ids_by_acc_domain[acc_domain] = (
+                        self._search_accounts_by_code(selectors)
+                        if selectors
+                        else self._search_accounts(acc_domain)
                     )
-                    account_ids += (
-                        self._account_model.with_company(company)
-                        .search(acc_domain_with_company)
-                        .ids
-                    )
-                self._account_ids_by_acc_domain[acc_domain].update(account_ids)
-                all_account_ids.update(account_ids)
+                all_account_ids.update(self._account_ids_by_acc_domain[acc_domain])
             self._map_account_ids[key] = list(all_account_ids)
 
     @classmethod
